@@ -10,7 +10,7 @@
 #   cd ../ReHLDS && podman build -f docker/ReHLDS/Dockerfile -t rehlds:latest .
 #   podman build -f docker/ReGameDLL/Dockerfile -t regamedll:latest .
 #   podman build -f docker/HLbase/Dockerfile    -t hlbase:latest    docker/HLbase
-#   podman build -f docker/runner/Dockerfile    -t hlds-server:latest docker/runner
+#   podman build -f docker/runner/Dockerfile    -t cs16-server:latest docker/runner
 #
 # On plain docker the images are not namespaced with localhost/, so pass:
 #   --build-arg HLBASE_IMAGE=hlbase:latest \

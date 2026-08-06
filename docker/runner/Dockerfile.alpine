@@ -18,7 +18,7 @@
 #
 # Build from repo root (ReHLDS image must exist first):
 #   cd ../ReHLDS && podman build -f docker/Dockerfile -t rehlds:alpine .
-#   podman build -f docker/Dockerfile.server -t hlds-server:alpine .
+#   podman build -f docker/Dockerfile.server -t cs16-server:alpine .
 #
 # The runtime image is Alpine. One stage is Debian on purpose: steamcmd is a glibc
 # binary that hangs on Alpine even under gcompat, so it runs in a throwaway fetch

@@ -11,7 +11,7 @@
 # restart. The content is untouched.
 #
 # Any arguments are passed through to hlds_linux, so
-#   podman run ... hlds-server:latest +map cs_office
+#   podman run ... cs16-server:latest +map cs_office
 # works. With no arguments a default de_dust2 setup is used.
 set -e
 

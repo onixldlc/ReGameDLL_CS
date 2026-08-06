@@ -15,8 +15,8 @@
 
 services:
   hlds:
-    image: ghcr.io/onixldlc/hlds-server:latest
-    container_name: hlds-server
+    image: ghcr.io/onixldlc/cs16-server:latest
+    container_name: cs16-server
     restart: unless-stopped
 
     # Host 8222 -> the engine's stock 27015 inside the container. Change the LEFT
@@ -46,7 +46,7 @@ services:
       - hlds-content:/opt/hlds
 
     # HLDS reads server commands from stdin; keep it attached so `docker attach
-    # hlds-server` gives a working console.
+    # cs16-server` gives a working console.
     stdin_open: true
     tty: true
 

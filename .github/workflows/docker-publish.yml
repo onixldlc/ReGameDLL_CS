@@ -10,7 +10,7 @@ name: Build and Push Docker Images
 # Images:
 #   regamedll   - compiled cs.so + dist + cssdk, context = repo root
 #   hlbase      - FROM scratch, carries only fetch-content.sh, context = docker/HLbase
-#   hlds-server - runner: rehlds + regamedll + the fetch script, context = docker/runner
+#   cs16-server - runner: rehlds + regamedll + the fetch script, context = docker/runner
 #
 # No image published here contains Valve game content. The runner downloads it with
 # steamcmd into a volume on first start, so each deployment fetches its own copy.
@@ -185,7 +185,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/hlds-server
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/cs16-server
           tags: |
             type=raw,value=${{ needs.determine-version.outputs.version }}
             type=raw,value=latest
@@ -208,7 +208,7 @@ jobs:
 
       - name: Check server image contents
         run: |
-          IMAGE="${{ env.REGISTRY }}/${{ github.repository_owner }}/hlds-server:latest"
+          IMAGE="${{ env.REGISTRY }}/${{ github.repository_owner }}/cs16-server:latest"
           # A real boot would pull ~700 MB of game content from Steam on every
           # release, so CI asserts the pieces instead: the fetcher, the 32-bit
           # engine and the game dll. End-to-end boot is covered by the compose file.
@@ -225,7 +225,7 @@ jobs:
 
       - name: Summary
         run: |
-          echo "**Image:** \`${{ env.REGISTRY }}/${{ github.repository_owner }}/hlds-server\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** \`${{ env.REGISTRY }}/${{ github.repository_owner }}/cs16-server\`" >> $GITHUB_STEP_SUMMARY
           echo "**Version:** \`${{ needs.determine-version.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
           echo "**Engine:** \`${{ steps.inputs.outputs.engine }}\`" >> $GITHUB_STEP_SUMMARY
           echo "**Base:** \`${{ steps.inputs.outputs.hlbase }}\`" >> $GITHUB_STEP_SUMMARY
