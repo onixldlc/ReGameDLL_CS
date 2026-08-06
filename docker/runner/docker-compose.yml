@@ -1,0 +1,54 @@
+# Counter-Strike 1.6 server: ReHLDS engine + ReGameDLL_CS game dll.
+#
+#   docker compose up -d
+#   docker compose logs -f
+#
+# The FIRST start downloads ~700 MB of game content from Steam into the named
+# volume and takes several minutes -- the server is not reachable until the log
+# says "content ready". Every start after that is immediate; the volume keeps the
+# content. Nothing is redistributed: each deployment fetches its own copy through
+# steamcmd, under its own Steam Subscriber Agreement.
+#
+# Updating the server: docker compose pull && docker compose up -d
+# The engine and game dll are re-installed from the image on every start; the
+# content is left alone.
+
+services:
+  hlds:
+    image: ghcr.io/onixldlc/hlds-server:latest
+    container_name: hlds-server
+    restart: unless-stopped
+
+    # Host 8222 -> the engine's stock 27015 inside the container. Change the LEFT
+    # side to move the public port; leave PORT alone.
+    ports:
+      - "8222:27015/udp"
+
+    environment:
+      # No VAC, so no Steam account and no Game Server Login Token is needed.
+      # Set INSECURE=0 and STEAM_ACCOUNT=<token> for a VAC-secure public server.
+      INSECURE: "1"
+      MAP: de_dust2
+      MAXPLAYERS: "12"
+      SV_LAN: "0"
+      #STEAM_ACCOUNT: ""
+
+      # Stage the download inside the volume so moving it into place is a rename
+      # instead of a 700 MB copy. The default (/tmp/hlds-fetch) is on the
+      # container filesystem, which means double the space and, if /tmp is a
+      # tmpfs, the whole download lands in RAM.
+      STAGE_DIR: /opt/hlds/.staging
+
+      # Set to 1 for one start to re-download and re-prune the content.
+      #FORCE_REFETCH: "1"
+
+    volumes:
+      - hlds-content:/opt/hlds
+
+    # HLDS reads server commands from stdin; keep it attached so `docker attach
+    # hlds-server` gives a working console.
+    stdin_open: true
+    tty: true
+
+volumes:
+  hlds-content:

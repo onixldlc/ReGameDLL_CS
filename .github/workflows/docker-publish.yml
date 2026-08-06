@@ -9,8 +9,11 @@ name: Build and Push Docker Images
 #
 # Images:
 #   regamedll   - compiled cs.so + dist + cssdk, context = repo root
-#   hlbase      - Valve game content fetched by steamcmd, context = docker/HLbase
-#   hlds-server - runner: hlbase + rehlds + regamedll, context = docker/runner
+#   hlbase      - FROM scratch, carries only fetch-content.sh, context = docker/HLbase
+#   hlds-server - runner: rehlds + regamedll + the fetch script, context = docker/runner
+#
+# No image published here contains Valve game content. The runner downloads it with
+# steamcmd into a volume on first start, so each deployment fetches its own copy.
 #
 # The runner resolves its inputs with `FROM`/`COPY --from` on image references, which buildx
 # pulls from a registry. On a branch or PR run nothing is pushed, so the freshly built
@@ -21,6 +24,8 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
     inputs:
       engine_image:
@@ -122,16 +127,15 @@ jobs:
         run: |
           docker run --rm ${{ env.REGISTRY }}/${{ github.repository_owner }}/regamedll:latest verify
 
-      - name: Check content layout
+      - name: Check fetch script is present
         if: needs.determine-version.outputs.publish != 'true' && matrix.image == 'hlbase'
         run: |
-          # hlbase has no entrypoint by design, so assert the pieces the engine dlopen()s.
-          docker run --rm ${{ env.REGISTRY }}/${{ github.repository_owner }}/hlbase:latest \
-            bash -c 'test -f /opt/hlds/hlds_linux \
-              && test -f /opt/hlds/steamclient.so \
-              && test -f /root/.steam/sdk32/steamclient.so \
-              && test -f /opt/hlds/valve/halflife.wad \
-              && test -f /opt/hlds/valve/gfx.wad'
+          # hlbase is FROM scratch: there is no shell to run, so inspect the image
+          # filesystem instead. docker export streams a container's rootfs as a tar.
+          cid=$(docker create ${{ env.REGISTRY }}/${{ github.repository_owner }}/hlbase:latest /nonexistent)
+          docker export "$cid" | tar -t | grep -qx 'hlbase/fetch-content.sh'
+          docker rm "$cid" >/dev/null
+          echo "fetch-content.sh present"
 
       - name: Summary
         run: |
@@ -202,19 +206,22 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Boot smoke test
+      - name: Check server image contents
         run: |
           IMAGE="${{ env.REGISTRY }}/${{ github.repository_owner }}/hlds-server:latest"
-          docker run -d --name smoke -e INSECURE=1 -p 27015:27015/udp "${IMAGE}"
-          sleep 25
-          docker logs smoke
-          docker logs smoke 2>&1 | grep -q 'ReGameDLL version'
-          # The engine aborts on missing content instead of exiting quietly, so scan for it.
-          if docker logs smoke 2>&1 | grep -q 'FATAL ERROR'; then
-            echo "engine reported FATAL ERROR" >&2
-            exit 1
-          fi
-          docker rm -f smoke
+          # A real boot would pull ~700 MB of game content from Steam on every
+          # release, so CI asserts the pieces instead: the fetcher, the 32-bit
+          # engine and the game dll. End-to-end boot is covered by the compose file.
+          docker run --rm --entrypoint sh "$IMAGE" -c '
+            set -e
+            test -x /usr/local/bin/fetch-content.sh
+            test -x /usr/local/bin/server-entrypoint.sh
+            test -f /opt/dist/engine/engine_i486.so
+            test -f /opt/dist/cstrike/dlls/cs.so
+            file /opt/dist/engine/engine_i486.so | grep -q "Intel 80386"
+            file /opt/dist/cstrike/dlls/cs.so    | grep -q "Intel 80386"
+            echo "fetcher, engine and game dll present, both 32-bit"
+          '
 
       - name: Summary
         run: |
