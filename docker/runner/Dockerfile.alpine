@@ -1,0 +1,180 @@
+# STATUS: not used, AND DOES NOT WORK AT RUNTIME. Kept for reference.
+#
+# This image builds successfully, and the engine plus game dll do load under musl +
+# gcompat (the log reaches "Console initialized" and prints the ReGameDLL version), but
+# the server then dies during Steam init:
+#   Error relocating /opt/hlds/steamclient.so: dlmopen: symbol not found
+#   FATAL ERROR (shutting down): Unable to initialize Steam.
+# dlmopen() is glibc-only; musl does not have it and gcompat does not implement it.
+# steamclient.so and libsteam_api.so are closed-source Valve blobs, and HLDS aborts when
+# Steam init fails (-insecure does not skip it), so no Dockerfile change fixes this.
+# steamcmd is likewise glibc-only and hangs on Alpine even under gcompat, which is why a
+# throwaway Debian stage fetches the game content here.
+#
+# The supported path is docker/runner/Dockerfile (Debian/glibc).
+
+# Runnable Counter-Strike server, Alpine (musl) — ReHLDS engine + ReGameDLL_CS game dll
+# + HLDS game content fetched by steamcmd at build time.
+#
+# Build from repo root (ReHLDS image must exist first):
+#   cd ../ReHLDS && podman build -f docker/Dockerfile -t rehlds:alpine .
+#   podman build -f docker/Dockerfile.server -t hlds-server:alpine .
+#
+# The runtime image is Alpine. One stage is Debian on purpose: steamcmd is a glibc
+# binary that hangs on Alpine even under gcompat, so it runs in a throwaway fetch
+# stage and only the downloaded game files are carried over.
+#
+# libc rules that shape this file:
+#   * the engine dlopen()s cs.so, so both must be musl -> cs.so is built on i386/alpine
+#   * engine_i486.so has a hard NEEDED entry for Valve's libsteam_api.so, which only
+#     exists as a glibc build -> gcompat provides ld-linux.so.2 and libc.so.6
+#   * HLDS also ships glibc libstdc++.so.6 / libgcc_s.so.1 next to the engine; those
+#     must go, musl's own libstdc++ is used instead
+
+ARG ALPINE_VERSION=3.21
+ARG ENGINE_IMAGE=localhost/rehlds:alpine
+
+
+# --- game content (glibc, throwaway) ---------------------------------------------
+FROM docker.io/library/debian:12-slim AS content
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN dpkg --add-architecture i386
+
+RUN apt-get update
+
+RUN apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        tar \
+        lib32gcc-s1 \
+        lib32stdc++6
+
+RUN rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /opt/steamcmd /opt/hlds
+
+RUN curl -sSL -o /tmp/steamcmd_linux.tar.gz https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz
+
+RUN tar xzf /tmp/steamcmd_linux.tar.gz -C /opt/steamcmd
+
+RUN rm -f /tmp/steamcmd_linux.tar.gz
+
+# Pre-anniversary HLDS (engine build <= 8684) is the ReHLDS-compatible platform, hence
+# -beta steam_legacy. steamcmd exits non-zero on transient states, so the result is
+# asserted below instead of trusting its exit code.
+RUN /opt/steamcmd/steamcmd.sh +force_install_dir /opt/hlds +login anonymous +app_set_config 90 mod cstrike +app_update 90 -beta steam_legacy validate +quit || true
+
+RUN test -f /opt/hlds/hlds_linux
+
+RUN test -d /opt/hlds/cstrike
+
+
+# --- game dll (musl) --------------------------------------------------------------
+FROM --platform=linux/386 docker.io/i386/alpine:${ALPINE_VERSION} AS regamedll
+
+RUN apk add --no-cache build-base
+
+RUN apk add --no-cache cmake
+
+RUN apk add --no-cache make
+
+RUN apk add --no-cache bash
+
+RUN apk add --no-cache git
+
+RUN apk add --no-cache linux-headers
+
+WORKDIR /src
+
+# Only what the build needs, so editing docker/* does not invalidate the compile layers.
+# .git is required: version/appversion.sh derives the build number from git rev-list.
+COPY CMakeLists.txt /src/CMakeLists.txt
+
+# referenced as ${PROJECT_SOURCE_DIR}/../version_script.lds by the link flags
+COPY version_script.lds /src/version_script.lds
+
+COPY .git /src/.git
+
+COPY dep /src/dep
+
+COPY dist /src/dist
+
+COPY regamedll /src/regamedll
+
+RUN git config --global --add safe.directory /src
+
+# regamedll/CMakeLists.txt adds -L regamedll/lib/linux32 whenever the pointer size is 4,
+# always true on a native 32-bit build. That directory ships glibc libm.so / librt.so /
+# libc-2.15.so, so -lm would resolve to glibc and cs.so would NEED libm.so.6 on top of
+# musl. Drop them from the index first (otherwise `git ls-files -m` reports a dirty tree
+# and appversion.sh stamps "+m"), then delete them.
+RUN git -C /src update-index --force-remove regamedll/lib/linux32/libm.so regamedll/lib/linux32/librt.so regamedll/lib/linux32/libc-2.15.so
+
+RUN rm -f /src/regamedll/lib/linux32/libm.so /src/regamedll/lib/linux32/librt.so /src/regamedll/lib/linux32/libc-2.15.so
+
+# tracked files absent from this partial context would also read as a dirty tree
+RUN git -C /src ls-files --deleted -z | xargs -0 -r git -C /src update-index --force-remove
+
+RUN cmake -B build -DUSE_STATIC_LIBSTDC=ON
+
+RUN cmake --build build -j"$(nproc)"
+
+
+# --- runtime (musl) ---------------------------------------------------------------
+FROM --platform=linux/386 docker.io/i386/alpine:${ALPINE_VERSION}
+
+RUN apk add --no-cache file
+
+# musl libstdc++ for engine_i486.so (NEEDED libstdc++.so.6)
+RUN apk add --no-cache libstdc++
+
+# gcompat supplies /lib/ld-linux.so.2 and libc.so.6 -> libgcompat.so.0, without which
+# loading the engine fails: "Error loading shared library ld-linux.so.2 ... (needed by
+# libsteam_api.so)"
+RUN apk add --no-cache gcompat
+
+COPY --from=content /opt/hlds /opt/hlds
+
+# steamcmd's steamclient.so, which HLDS expects at ~/.steam/sdk32/steamclient.so
+COPY --from=content /opt/steamcmd/linux32/steamclient.so /opt/steamcmd/linux32/steamclient.so
+
+# ReHLDS engine binaries (musl), built by ../ReHLDS/docker/Dockerfile
+ARG ENGINE_IMAGE
+
+COPY --from=${ENGINE_IMAGE} /opt/rehlds/bin/linux32/ /opt/hlds/
+
+# ReGameDLL_CS game dll (musl) + dist configs
+COPY --from=regamedll /src/build/regamedll/cs.so /opt/hlds/cstrike/dlls/cs.so
+
+COPY --from=regamedll /src/dist/ /opt/hlds/cstrike/
+
+# HLDS ships glibc libstdc++.so.6 / libgcc_s.so.1 beside the engine and LD_LIBRARY_PATH
+# puts that directory first, so they would shadow musl's. libsteam_api.so stays: the
+# engine links it by name and gcompat loads it.
+RUN rm -f /opt/hlds/libstdc++.so.6 /opt/hlds/libgcc_s.so.1
+
+RUN mkdir -p /root/.steam/sdk32
+
+RUN ln -sf /opt/steamcmd/linux32/steamclient.so /root/.steam/sdk32/steamclient.so
+
+COPY server-entrypoint.sh /usr/local/bin/server-entrypoint.sh
+
+RUN chmod +x /usr/local/bin/server-entrypoint.sh
+
+ENV HLDS_DIR=/opt/hlds
+
+# HLDS default. Do not change this to publish on another port -- map it instead:
+#   podman run -p 8222:27015/udp ...
+ENV PORT=27015
+
+ENV MAP=de_dust2
+
+ENV MAXPLAYERS=12
+
+EXPOSE 27015/udp
+
+WORKDIR /opt/hlds
+
+ENTRYPOINT ["/usr/local/bin/server-entrypoint.sh"]

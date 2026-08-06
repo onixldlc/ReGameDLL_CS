@@ -1,0 +1,225 @@
+name: Build and Push Docker Images
+
+# Build strategy mirrors onixldlc/elkstack (buildx + ghcr + metadata-action + gha cache).
+# Versioning mirrors onixldlc/mcp-linux-go (tag -> ref name minus "v", otherwise git describe).
+#
+# Every push and PR builds the images (compile check). Only a pushed tag v* logs in and
+# publishes. Debian is the only variant built here; the Dockerfile.alpine files are
+# reference material and are deliberately not built.
+#
+# Images:
+#   regamedll   - compiled cs.so + dist + cssdk, context = repo root
+#   hlbase      - Valve game content fetched by steamcmd, context = docker/HLbase
+#   hlds-server - runner: hlbase + rehlds + regamedll, context = docker/runner
+#
+# The runner resolves its inputs with `FROM`/`COPY --from` on image references, which buildx
+# pulls from a registry. On a branch or PR run nothing is pushed, so the freshly built
+# regamedll/hlbase are not fetchable and the runner cannot be assembled. It therefore runs on
+# tag pushes (and manual dispatch) only.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      engine_image:
+        description: 'Engine image for the runner (default ghcr.io/<owner>/rehlds:latest)'
+        required: false
+        default: ''
+
+env:
+  REGISTRY: ghcr.io
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  determine-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      publish: ${{ steps.version.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # appversion.sh derives the build number from `git rev-list --count`; a shallow
+          # clone makes every build "1". Full history is mandatory, not an optimisation.
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF_NAME}"
+            PUBLISH=true
+          else
+            VERSION="$(git describe --tags --always --dirty 2>/dev/null || echo dev)"
+            PUBLISH=false
+          fi
+          # Keep the string usable as a docker tag.
+          VERSION="$(printf %s "${VERSION}" | tr -c 'A-Za-z0-9._-' '-')"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "publish=${PUBLISH}" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: ${VERSION} (publish=${PUBLISH})"
+
+  build-and-push:
+    runs-on: ubuntu-latest
+    needs: determine-version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: regamedll
+            context: .
+            dockerfile: ./docker/ReGameDLL/Dockerfile
+          - image: hlbase
+            context: ./docker/HLbase
+            dockerfile: ./docker/HLbase/Dockerfile
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # regamedll/extra/cssdk is a submodule; the build asserts extdll.h is present.
+          submodules: recursive
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        if: needs.determine-version.outputs.publish == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}
+          tags: |
+            type=raw,value=${{ needs.determine-version.outputs.version }}
+            type=raw,value=latest
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: ${{ needs.determine-version.outputs.publish == 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          load: ${{ needs.determine-version.outputs.publish != 'true' }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify artifacts
+        if: needs.determine-version.outputs.publish != 'true' && matrix.image == 'regamedll'
+        run: |
+          docker run --rm ${{ env.REGISTRY }}/${{ github.repository_owner }}/regamedll:latest verify
+
+      - name: Check content layout
+        if: needs.determine-version.outputs.publish != 'true' && matrix.image == 'hlbase'
+        run: |
+          # hlbase has no entrypoint by design, so assert the pieces the engine dlopen()s.
+          docker run --rm ${{ env.REGISTRY }}/${{ github.repository_owner }}/hlbase:latest \
+            bash -c 'test -f /opt/hlds/hlds_linux \
+              && test -f /opt/hlds/steamclient.so \
+              && test -f /root/.steam/sdk32/steamclient.so \
+              && test -f /opt/hlds/valve/halflife.wad \
+              && test -f /opt/hlds/valve/gfx.wad'
+
+      - name: Summary
+        run: |
+          echo "**Image:** \`${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** \`${{ needs.determine-version.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Published:** \`${{ needs.determine-version.outputs.publish }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Tags:** \`${{ needs.determine-version.outputs.version }}\`, \`latest\`" >> $GITHUB_STEP_SUMMARY
+
+  runner:
+    name: Build and push runner
+    runs-on: ubuntu-latest
+    needs: [determine-version, build-and-push]
+    if: needs.determine-version.outputs.publish == 'true' || github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve input images
+        id: inputs
+        run: |
+          OWNER="${{ github.repository_owner }}"
+          ENGINE="${{ github.event.inputs.engine_image }}"
+          if [[ -z "${ENGINE}" ]]; then
+            # The engine lives in the ReHLDS repo and is versioned independently, so the
+            # runner tracks its floating :latest tag rather than this repo's version.
+            ENGINE="${{ env.REGISTRY }}/${OWNER}/rehlds:latest"
+          fi
+          VER="${{ needs.determine-version.outputs.version }}"
+          if [[ "${{ needs.determine-version.outputs.publish }}" != "true" ]]; then
+            VER="latest"
+          fi
+          echo "engine=${ENGINE}" >> "$GITHUB_OUTPUT"
+          echo "hlbase=${{ env.REGISTRY }}/${OWNER}/hlbase:${VER}" >> "$GITHUB_OUTPUT"
+          echo "gamedll=${{ env.REGISTRY }}/${OWNER}/regamedll:${VER}" >> "$GITHUB_OUTPUT"
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/hlds-server
+          tags: |
+            type=raw,value=${{ needs.determine-version.outputs.version }}
+            type=raw,value=latest
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: ./docker/runner
+          file: ./docker/runner/Dockerfile
+          push: ${{ needs.determine-version.outputs.publish == 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          load: ${{ needs.determine-version.outputs.publish != 'true' }}
+          build-args: |
+            HLBASE_IMAGE=${{ steps.inputs.outputs.hlbase }}
+            ENGINE_IMAGE=${{ steps.inputs.outputs.engine }}
+            GAMEDLL_IMAGE=${{ steps.inputs.outputs.gamedll }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Boot smoke test
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ github.repository_owner }}/hlds-server:latest"
+          docker run -d --name smoke -e INSECURE=1 -p 27015:27015/udp "${IMAGE}"
+          sleep 25
+          docker logs smoke
+          docker logs smoke 2>&1 | grep -q 'ReGameDLL version'
+          # The engine aborts on missing content instead of exiting quietly, so scan for it.
+          if docker logs smoke 2>&1 | grep -q 'FATAL ERROR'; then
+            echo "engine reported FATAL ERROR" >&2
+            exit 1
+          fi
+          docker rm -f smoke
+
+      - name: Summary
+        run: |
+          echo "**Image:** \`${{ env.REGISTRY }}/${{ github.repository_owner }}/hlds-server\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** \`${{ needs.determine-version.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Engine:** \`${{ steps.inputs.outputs.engine }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Base:** \`${{ steps.inputs.outputs.hlbase }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Game dll:** \`${{ steps.inputs.outputs.gamedll }}\`" >> $GITHUB_STEP_SUMMARY

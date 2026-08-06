@@ -1,16 +1,16 @@
 name: C/C++ CI
 
 on:
-  push:
-    branches: [master]
-    paths-ignore:
-      - '**.md'
-      - '.github/**'
+  # push:
+  #   branches: [master]
+  #   paths-ignore:
+  #     - '**.md'
+  #     - '.github/**'
 
-  pull_request:
-    types: [opened, reopened, synchronize]
-  release:
-    types: [published]
+  # pull_request:
+  #   types: [opened, reopened, synchronize]
+  # release:
+  #   types: [published]
   workflow_dispatch:
 
 jobs:

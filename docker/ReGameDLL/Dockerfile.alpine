@@ -1,0 +1,110 @@
+# STATUS: not used. Kept for reference.
+#
+# This Alpine/musl recipe WORKS as an artifact builder: it produces a musl cs.so and
+# passes its own check (podman build -f docker/ReGameDLL/Dockerfile.alpine -t regamedll:alpine . &&
+# podman run --rm regamedll:alpine verify).
+#
+# It is not wired into the server image, because the engine dlopen()s cs.so and the two
+# must share a libc -- and the engine cannot be musl (see docker/Dockerfile.server.alpine).
+#
+# The supported path is docker/ReGameDLL/Dockerfile (Debian/glibc).
+
+# ReGameDLL_CS build image — Alpine (musl) variant
+#
+# Build from repo root:
+#   podman build -f docker/Dockerfile -t regamedll:alpine .
+#
+# Why i386/alpine and not alpine + -m32:
+#   Alpine has no gcc-multilib package, so a 32-bit build on the x86_64 image is
+#   not possible. i386/alpine is a native 32-bit x86 userland, so plain gcc emits
+#   32-bit code. CMake then sees CMAKE_SIZEOF_VOID_P == 4 and skips both -m32 and
+#   the bundled glibc-built lib/linux32/libaelf32.a — which is what we want on musl.
+#
+# ABI caveat:
+#   cs.so produced here is linked against musl. The Half-Life engine loads the
+#   game dll with dlopen, so it must match the engine's libc. Pair this build with
+#   a musl/Alpine-built engine. For a stock glibc HLDS/ReHLDS engine, build a
+#   Debian-based variant instead.
+#
+#   USE_STATIC_LIBSTDC=ON keeps libstdc++/libgcc inside cs.so so the runtime does
+#   not need a C++ runtime present.
+#
+#   USE_LEGACY_LIBC stays OFF — it links the repo's bundled glibc 2.15 stubs
+#   (regamedll/lib/linux32/libc-2.15.so), which are meaningless under musl.
+
+ARG ALPINE_VERSION=3.21
+
+FROM --platform=linux/386 docker.io/i386/alpine:${ALPINE_VERSION} AS builder
+
+RUN apk add --no-cache build-base
+
+RUN apk add --no-cache cmake
+
+RUN apk add --no-cache make
+
+# appversion.sh is #!/bin/bash and derives the build number from git rev-list
+RUN apk add --no-cache bash
+
+RUN apk add --no-cache git
+
+# linux/limits.h (game_shared/counter.h) is not in musl-dev
+RUN apk add --no-cache linux-headers
+
+WORKDIR /src
+
+COPY . /src
+
+RUN git config --global --add safe.directory /src
+
+# regamedll/CMakeLists.txt adds -L regamedll/lib/linux32 whenever the pointer size
+# is 4, which is always true on a native 32-bit build. That directory ships glibc
+# libm.so / librt.so / libc-2.15.so, so -lm would resolve to glibc and cs.so would
+# end up NEEDing libm.so.6 on top of musl. Drop them from the build context copy;
+# libaelf32.a stays (unused here, no -m32 path taken).
+# appversion.sh stamps "+m" on the version when `git ls-files -m` is non-empty, so
+# drop these paths from the git index first, otherwise removing them makes every build
+# report a dirty tree (--assume-unchanged does not cover deletions).
+RUN git -C /src update-index --force-remove regamedll/lib/linux32/libm.so regamedll/lib/linux32/librt.so regamedll/lib/linux32/libc-2.15.so
+
+RUN rm -f /src/regamedll/lib/linux32/libm.so /src/regamedll/lib/linux32/librt.so /src/regamedll/lib/linux32/libc-2.15.so
+
+RUN cmake -B build -DUSE_STATIC_LIBSTDC=ON
+
+RUN cmake --build build -j"$(nproc)"
+
+# Lay out artifacts the same way the CI "Move files" / "Prepare CSSDK" steps do
+RUN mkdir -p /publish/bin/linux32/cstrike/dlls
+
+RUN mv build/regamedll/cs.so /publish/bin/linux32/cstrike/dlls/cs.so
+
+RUN mv regamedll/version/appversion.h /publish/appversion.h
+
+RUN cp -a dist /publish/dist
+
+RUN mkdir -p /publish/cssdk
+
+RUN cp -a regamedll/extra/cssdk/. /publish/cssdk/
+
+RUN rm -rf /publish/cssdk/.git /publish/cssdk/LICENSE /publish/cssdk/README.md
+
+
+FROM --platform=linux/386 docker.io/i386/alpine:${ALPINE_VERSION}
+
+RUN apk add --no-cache file
+
+COPY --from=builder /publish /opt/regamedll
+
+COPY docker/ReGameDLL/entrypoint.sh /usr/local/bin/entrypoint.sh
+
+COPY docker/ReGameDLL/verify.sh /usr/local/bin/verify.sh
+
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/verify.sh
+
+# Mount the HLDS tree (the directory containing cstrike/) here
+VOLUME ["/opt/hlds"]
+
+WORKDIR /opt/hlds
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+
+CMD ["install"]
